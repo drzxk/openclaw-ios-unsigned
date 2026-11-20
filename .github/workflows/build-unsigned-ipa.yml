@@ -1,0 +1,155 @@
+name: build-unsigned-ipa
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: "Source repository"
+        default: "openclaw/openclaw"
+        required: true
+      source_ref:
+        description: "Source ref (tag/branch/sha) — v2026.9.8 is the last iOS 18 build"
+        default: "v2026.9.8"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 300
+
+    steps:
+      - name: Checkout OpenClaw source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.source_repo }}
+          ref: ${{ inputs.source_ref }}
+          path: src
+          fetch-depth: 1
+
+      - name: Show source identity
+        working-directory: src
+        run: |
+          set -euo pipefail
+          git log -1 --format='commit %H%nsubjec  %s%ndate    %cI'
+          node -e 'const p=require("./package.json"); console.log("package.json version:", p.version)'
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24.21.0"
+
+      - name: Setup pnpm
+        run: |
+          set -euo pipefail
+          corepack enable
+          corepack prepare pnpm@12.5.1 --activate
+          pnpm --version
+
+      - name: Install JS workspace deps (needed by xcodegen preGen mermaid build)
+        working-directory: src
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile --reporter=append-only
+
+      - name: Install pinned iOS build tools (xcodegen/swiftformat/swiftlint)
+        working-directory: src
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/ios-tools"
+          ./scripts/install-xcodegen.sh "$tools_dir"
+          ./scripts/install-swift-tools.sh "$tools_dir"
+          echo "$tools_dir" >> "$GITHUB_PATH"
+          "$tools_dir/xcodegen" --version
+          "$tools_dir/swiftformat" --version
+          "$tools_dir/swiftlint" version
+
+      - name: Install Watch Rust toolchain
+        working-directory: src
+        run: |
+          set -euo pipefail
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+          fi
+          . "$HOME/.cargo/env"
+          watch_toolchain="$(awk -F '"' '/^channel =/ { print $2; exit }' apps/shared/OpenClawWatchRTC/rust-toolchain.toml)"
+          echo "watch toolchain: $watch_toolchain"
+          test -n "$watch_toolchain"
+          rustup toolchain install "$watch_toolchain" --profile minimal --component rust-src
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Select Xcode
+        run: |
+          set -euo pipefail
+          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          xcodebuild -version
+          xcode-select -p
+          ls /Applications | grep -i xcode || true
+
+      - name: Generate Xcode project
+        working-directory: src
+        run: |
+          set -euo pipefail
+          ./scripts/ios-configure-signing.sh
+          ./scripts/ios-write-version-xcconfig.sh
+          node scripts/ios-write-swift-filelist.mjs
+          cd apps/ios
+          xcodegen generate
+          echo "--- generated Version.xcconfig ---"
+          cat build/Version.xcconfig || true
+
+      - name: Archive (signing disabled)
+        working-directory: src/apps/ios
+        run: |
+          set -euo pipefail
+          set -o pipefail
+          xcodebuild archive \
+            -project OpenClaw.xcodeproj \
+            -scheme OpenClaw \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/OpenClaw.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            DEVELOPMENT_TEAM="" \
+            2>&1 | tee "$RUNNER_TEMP/archive.log" || {
+              echo "::error::archive failed — last 200 lines below"
+              tail -n 200 "$RUNNER_TEMP/archive.log"
+              exit 1
+            }
+
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+          app="$(find "$RUNNER_TEMP/OpenClaw.xcarchive/Products/Applications" -maxdepth 1 -name '*.app' -print -quit)"
+          test -n "$app"
+          echo "app bundle: $app"
+          echo "--- Info.plist (key fields) ---"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$app/Info.plist" || echo "(MinimumOSVersion absent in Info.plist)"
+          echo "--- embedded targets ---"
+          ls -1 "$app" | head -40
+          mkdir -p "$RUNNER_TEMP/pkg/Payload"
+          cp -R "$app" "$RUNNER_TEMP/pkg/Payload/"
+          version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Info.plist")"
+          cd "$RUNNER_TEMP/pkg"
+          zip -qry "$RUNNER_TEMP/OpenClaw-${version}-unsigned.ipa" Payload
+          ls -lh "$RUNNER_TEMP/OpenClaw-${version}-unsigned.ipa"
+          shasum -a 256 "$RUNNER_TEMP/OpenClaw-${version}-unsigned.ipa"
+          echo "IPA_PATH=$RUNNER_TEMP/OpenClaw-${version}-unsigned.ipa" >> "$GITHUB_ENV"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openclaw-unsigned-ipa
+          path: |
+            ${{ env.IPA_PATH }}
+            ${{ runner.temp }}/archive.log
+          if-no-files-found: error
+          retention-days: 90
