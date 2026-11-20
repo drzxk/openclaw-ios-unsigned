@@ -72,13 +72,16 @@ jobs:
           set -euo pipefail
           if ! command -v rustup >/dev/null 2>&1; then
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+            if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi
           fi
-          . "$HOME/.cargo/env"
+          rustup --version
           watch_toolchain="$(awk -F '"' '/^channel =/ { print $2; exit }' apps/shared/OpenClawWatchRTC/rust-toolchain.toml)"
           echo "watch toolchain: $watch_toolchain"
           test -n "$watch_toolchain"
           rustup toolchain install "$watch_toolchain" --profile minimal --component rust-src
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          rustup toolchain list
+          cargo --version || true
+          if [ -d "$HOME/.cargo/bin" ]; then echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"; fi
 
       - name: Select Xcode
         run: |
